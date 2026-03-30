@@ -2,7 +2,7 @@
 // @name         Zentao Bug + Testcase Capture
 // @name:zh-CN   禅道 Bug/用例采集推送面板
 // @namespace    https://github.com/chenwenbo/zentao-capture
-// @version      6.2.1
+// @version      6.2.2
 // @description  Capture bug/testcase creation events in ZenTao QA pages, match entity IDs from list pages, and push records to a custom backend. Features a draggable floating button and filterable record panel.
 // @description:zh-CN  在禅道 QA 页面采集 Bug/用例创建信息，识别编号与创建者，推送到自定义后端服务，提供可拖动悬浮按钮与记录面板。
 // @author       chenwenbo
