@@ -120,6 +120,7 @@
     lastFallbackReason: '',
     lastHref: ''
   };
+  let lastExpiredToastKey = '';
 
   function escapeHtml(v) {
     return String(v || '')
@@ -161,7 +162,48 @@
       return fallback;
     }
   }
-  function writeJson(key, value) { localStorage.setItem(key, JSON.stringify(value)); }
+  function tryEvictOldRecords() {
+    const recordsKey = CONFIG.STORAGE_KEYS.records;
+    const raw = localStorage.getItem(recordsKey);
+    if (!raw) return 0;
+    let records = [];
+    try {
+      records = JSON.parse(raw);
+    } catch (err) {
+      logError('tryEvictOldRecords parse failed', { key: recordsKey, error: err?.message || String(err) });
+      return 0;
+    }
+    if (!Array.isArray(records) || !records.length) return 0;
+
+    let removed = 0;
+    for (let i = records.length - 1; i >= 0 && removed < 20; i -= 1) {
+      const status = records[i]?.pushStatus;
+      if (status === 'success' || status === 'duplicate') {
+        records.splice(i, 1);
+        removed += 1;
+      }
+    }
+    if (!removed) return 0;
+
+    localStorage.setItem(recordsKey, JSON.stringify(records));
+    logWarn('tryEvictOldRecords removed old finished records', { removed, remaining: records.length });
+    return removed;
+  }
+  function writeJson(key, value) {
+    const serialized = JSON.stringify(value);
+    try {
+      localStorage.setItem(key, serialized);
+    } catch (err) {
+      logError('writeJson failed', { key, error: err?.message || String(err) });
+      try {
+        tryEvictOldRecords();
+        localStorage.setItem(key, serialized);
+      } catch (retryErr) {
+        logError('writeJson retry failed', { key, error: retryErr?.message || String(retryErr) });
+        UIService.showToast('本地存储空间不足，部分数据可能未保存', 'error', 5000);
+      }
+    }
+  }
 
   const StorageService = {
     getSettings: () => readJson(CONFIG.STORAGE_KEYS.settings, { useAlertOnCapture: CONFIG.DEFAULT_USE_ALERT_ON_CAPTURE }),
@@ -175,7 +217,21 @@
     getTestcaseCache: () => readJson(CONFIG.STORAGE_KEYS.testcaseCache, null),
     saveTestcaseCache: (v) => writeJson(CONFIG.STORAGE_KEYS.testcaseCache, v),
     getRecords: () => readJson(CONFIG.STORAGE_KEYS.records, []),
-    saveRecords: (records) => writeJson(CONFIG.STORAGE_KEYS.records, (records || []).slice(0, CONFIG.MAX_RECORDS)),
+    saveRecords: (records) => {
+      const list = Array.isArray(records) ? records : [];
+      const unfinished = list.filter((r) => r.pushStatus === 'pending' || r.pushStatus === 'failed');
+      const finished = list.filter((r) => r.pushStatus !== 'pending' && r.pushStatus !== 'failed');
+      const ordered = [...unfinished, ...finished];
+      const trimmed = ordered.slice(0, CONFIG.MAX_RECORDS);
+      if (unfinished.length > CONFIG.MAX_RECORDS) {
+        logWarn('saveRecords truncate dropped unfinished records', {
+          unfinishedCount: unfinished.length,
+          maxRecords: CONFIG.MAX_RECORDS,
+          droppedUnfinished: unfinished.length - CONFIG.MAX_RECORDS
+        });
+      }
+      writeJson(CONFIG.STORAGE_KEYS.records, trimmed);
+    },
     getFabPosition: () => readJson(CONFIG.STORAGE_KEYS.fabPos, { left: null, top: null }),
     saveFabPosition: (v) => writeJson(CONFIG.STORAGE_KEYS.fabPos, v),
     getPanelFilters: () => readJson(CONFIG.STORAGE_KEYS.panelFilters, { entityType: 'all', pushStatus: 'all', keyword: '' }),
@@ -1037,6 +1093,9 @@
 
   async function pushRecordToServer(record, qaDoc, pageType, extra = {}) {
     const endpoint = getSyncEndpoint();
+    if (!endpoint || !/^https?:\/\//i.test(endpoint)) {
+      throw new Error('推送地址未配置或无效，请检查 CONFIG.API_BASE_URL 和 CONFIG.SYNC_ENDPOINT');
+    }
     const payload = buildStandardRecord(record, qaDoc, pageType, extra);
     const timeout = CONFIG.REQUEST_TIMEOUT_MS;
     const requestHeaders = buildRequestHeaders();
@@ -1136,15 +1195,31 @@
   }
 
   const PushService = {
-    pushingSet: new Set(),
-    async pushByUniqueKey(uniqueKey, qaDoc = null, pageType = '') {
-      const record = getRecords().find((r) => r.uniqueKey === uniqueKey);
-      if (!record || this.pushingSet.has(uniqueKey)) return;
-      if ((record.retryCount || 0) >= CONFIG.MAX_RETRY && record.pushStatus === 'failed') {
+    pushingSet: new Map(),
+    async pushByUniqueKey(uniqueKey, qaDoc = null, pageType = '', manual = false) {
+      let record = getRecords().find((r) => r.uniqueKey === uniqueKey);
+      if (!record) return;
+      if (this.pushingSet.has(uniqueKey)) {
+        const pushingSince = Number(this.pushingSet.get(uniqueKey)) || 0;
+        const elapsed = getNow() - pushingSince;
+        const staleThreshold = CONFIG.REQUEST_TIMEOUT_MS * 2;
+        if (pushingSince > 0 && elapsed > staleThreshold) {
+          this.pushingSet.delete(uniqueKey);
+          logWarn('stale pushing lock evicted', { uniqueKey, elapsed, staleThreshold });
+        } else {
+          UIService.showToast('该记录正在推送中，请稍后', 'warning', 2000);
+          return;
+        }
+      }
+      if (!manual && (record.retryCount || 0) >= CONFIG.MAX_RETRY && record.pushStatus === 'failed') {
         logWarn('push skipped: retry limit reached', { uniqueKey, retryCount: record.retryCount });
         return;
       }
-      this.pushingSet.add(uniqueKey);
+      if (manual) {
+        updateRecord(uniqueKey, { retryCount: 0 });
+        record = { ...record, retryCount: 0 };
+      }
+      this.pushingSet.set(uniqueKey, getNow());
       logInfo('updateRecord before', {
         uniqueKey,
         fromStatus: record.pushStatus || '',
@@ -1228,8 +1303,8 @@
         this.pushingSet.delete(uniqueKey);
       }
     },
-    async pushAllPendingRecords(qaDoc = null, pageType = '') {
-      await Promise.all(getPendingOrFailedRecords().map((item) => this.pushByUniqueKey(item.uniqueKey, qaDoc, pageType)));
+    async pushAllPendingRecords(qaDoc = null, pageType = '', manual = false) {
+      await Promise.all(getPendingOrFailedRecords().map((item) => this.pushByUniqueKey(item.uniqueKey, qaDoc, pageType, manual)));
     }
   };
 
@@ -1245,6 +1320,13 @@
     if (shouldSkipListScan('bug')) return false;
     const cache = StorageService.getBugCache();
     if (!isRecentCache(cache)) {
+      if (cache) {
+        const expiredKey = `bug:${(cache?.draft?.bugTitle || '').trim() || String(cache?.time || '')}`;
+        if (expiredKey && lastExpiredToastKey !== expiredKey) {
+          lastExpiredToastKey = expiredKey;
+          UIService.showToast('Bug 采集缓存已超时（超过 5 分钟），请重新在创建页提交以触发采集', 'warning', 5000);
+        }
+      }
       logInfo('bug list matching skip', { pageType: 'bug-list', reason: 'cache-not-recent' });
       return false;
     }
@@ -1322,6 +1404,13 @@
     if (shouldSkipListScan('testcase')) return false;
     const cache = StorageService.getTestcaseCache();
     if (!isRecentCache(cache)) {
+      if (cache) {
+        const expiredKey = `testcase:${(cache?.draft?.caseTitle || '').trim() || String(cache?.time || '')}`;
+        if (expiredKey && lastExpiredToastKey !== expiredKey) {
+          lastExpiredToastKey = expiredKey;
+          UIService.showToast('用例采集缓存已超时（超过 5 分钟），请重新在创建页提交以触发采集', 'warning', 5000);
+        }
+      }
       logInfo('testcase list matching skip', { pageType: 'testcase-list', reason: 'cache-not-recent' });
       return false;
     }
@@ -1511,9 +1600,9 @@
         StorageService.savePanelOpen(false);
       });
       panel.querySelector('#zentao-retry-failed-btn').addEventListener('click', async () => {
-        for (const item of getRecords().filter((r) => r.pushStatus === 'failed')) await PushService.pushByUniqueKey(item.uniqueKey);
+        for (const item of getRecords().filter((r) => r.pushStatus === 'failed')) await PushService.pushByUniqueKey(item.uniqueKey, null, '', true);
       });
-      panel.querySelector('#zentao-retry-all-btn').addEventListener('click', async () => { await PushService.pushAllPendingRecords(); });
+      panel.querySelector('#zentao-retry-all-btn').addEventListener('click', async () => { await PushService.pushAllPendingRecords(null, '', true); });
       panel.querySelector('#zentao-alert-toggle').addEventListener('change', (e) => {
         const checked = !!e.target.checked;
         StorageService.saveSettings({ useAlertOnCapture: checked });
@@ -1636,7 +1725,7 @@
       listEl.querySelectorAll('.zentao-retry-one-btn').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const uniqueKey = btn.getAttribute('data-unique-key');
-          if (uniqueKey) await PushService.pushByUniqueKey(uniqueKey);
+          if (uniqueKey) await PushService.pushByUniqueKey(uniqueKey, null, '', true);
         });
       });
 
