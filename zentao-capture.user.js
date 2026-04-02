@@ -31,7 +31,7 @@
   /******************** 配置区 ********************/
   const CONFIG = {
     DEBUG: false,
-    SCRIPT_VERSION: '6.1.2-debug1',
+    SCRIPT_VERSION: '6.3.0',
     API_BASE_URL: 'http://192.168.2.229:8000',
     SYNC_ENDPOINT: '/api/zentao/browser-sync',
     // 请替换为你的真实后端同步密钥（X-Zentao-Sync-Key）
@@ -120,7 +120,6 @@
     lastFallbackReason: '',
     lastHref: ''
   };
-  let lastExpiredToastKey = '';
 
   function escapeHtml(v) {
     return String(v || '')
@@ -214,8 +213,10 @@
     },
     getBugCache: () => readJson(CONFIG.STORAGE_KEYS.bugCache, null),
     saveBugCache: (v) => writeJson(CONFIG.STORAGE_KEYS.bugCache, v),
+    clearBugCache: () => localStorage.removeItem(CONFIG.STORAGE_KEYS.bugCache),
     getTestcaseCache: () => readJson(CONFIG.STORAGE_KEYS.testcaseCache, null),
     saveTestcaseCache: (v) => writeJson(CONFIG.STORAGE_KEYS.testcaseCache, v),
+    clearTestcaseCache: () => localStorage.removeItem(CONFIG.STORAGE_KEYS.testcaseCache),
     getRecords: () => readJson(CONFIG.STORAGE_KEYS.records, []),
     saveRecords: (records) => {
       const list = Array.isArray(records) ? records : [];
@@ -1321,11 +1322,8 @@
     const cache = StorageService.getBugCache();
     if (!isRecentCache(cache)) {
       if (cache) {
-        const expiredKey = `bug:${(cache?.draft?.bugTitle || '').trim() || String(cache?.time || '')}`;
-        if (expiredKey && lastExpiredToastKey !== expiredKey) {
-          lastExpiredToastKey = expiredKey;
-          UIService.showToast('Bug 采集缓存已超时（超过 5 分钟），请重新在创建页提交以触发采集', 'warning', 5000);
-        }
+        UIService.showToast('Bug 采集缓存已超时（超过 5 分钟），已自动清理，请重新在创建页提交以触发采集', 'warning', 5000);
+        StorageService.clearBugCache();
       }
       logInfo('bug list matching skip', { pageType: 'bug-list', reason: 'cache-not-recent' });
       return false;
@@ -1381,6 +1379,7 @@
       pushStatus: 'pending',
       pushMessage: '等待推送'
     });
+    StorageService.clearBugCache();
 
     logInfo('bug list matched', { bugId, title, creatorName, sourceCaseInfo, uniqueKey: record.uniqueKey });
     notifyCaptureSuccess([
@@ -1405,11 +1404,8 @@
     const cache = StorageService.getTestcaseCache();
     if (!isRecentCache(cache)) {
       if (cache) {
-        const expiredKey = `testcase:${(cache?.draft?.caseTitle || '').trim() || String(cache?.time || '')}`;
-        if (expiredKey && lastExpiredToastKey !== expiredKey) {
-          lastExpiredToastKey = expiredKey;
-          UIService.showToast('用例采集缓存已超时（超过 5 分钟），请重新在创建页提交以触发采集', 'warning', 5000);
-        }
+        UIService.showToast('用例采集缓存已超时（超过 5 分钟），已自动清理，请重新在创建页提交以触发采集', 'warning', 5000);
+        StorageService.clearTestcaseCache();
       }
       logInfo('testcase list matching skip', { pageType: 'testcase-list', reason: 'cache-not-recent' });
       return false;
@@ -1464,6 +1460,7 @@
       pushStatus: 'pending',
       pushMessage: '等待推送'
     });
+    StorageService.clearTestcaseCache();
 
     logInfo('testcase list matched', { caseId, title, creatorName, uniqueKey: record.uniqueKey });
     notifyCaptureSuccess([
